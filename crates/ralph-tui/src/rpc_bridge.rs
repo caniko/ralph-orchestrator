@@ -373,15 +373,20 @@ mod tests {
 
     fn make_event(topic: &str, payload: Value) -> StreamEvent {
         StreamEvent {
+            api_version: "1".to_string(),
+            stream: "task".to_string(),
             topic: topic.to_string(),
             cursor: "1234-0".to_string(),
             sequence: 0,
+            ts: "2026-01-01T00:00:00Z".to_string(),
             resource: StreamResource {
                 kind: "task".to_string(),
                 id: "task-1".to_string(),
             },
             replay: StreamReplay {
                 mode: "live".to_string(),
+                requested_cursor: None,
+                batch: None,
             },
             payload,
         }

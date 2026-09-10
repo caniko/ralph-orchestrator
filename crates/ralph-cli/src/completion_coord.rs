@@ -33,7 +33,7 @@ use crate::display::print_termination;
 /// engine ran the loop. `context` is `None` only for ad-hoc runs with no loop
 /// identity (no merge-queue / registry participation in that case).
 ///
-/// `console` gates the human-readable termination banner. In `--rpc` mode
+/// `print_banner` gates the human-readable termination banner. In `--rpc` mode
 /// stdout is the protocol channel (JSON-lines `RpcEvent` stream), so callers
 /// pass `false` to keep it clean — the banner's information is already carried
 /// by the `LoopTerminated` event.

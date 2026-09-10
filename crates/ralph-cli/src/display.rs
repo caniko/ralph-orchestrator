@@ -5,13 +5,6 @@
 
 use ralph_core::{EventRecord, TerminationReason, truncate_with_ellipsis};
 
-/// Truncates a string to `max_len` characters, adding an ellipsis if it was
-/// cut. Thin wrapper over [`truncate_with_ellipsis`] so callers can write
-/// `display::truncate(...)` without the `ralph_core::` path.
-pub fn truncate(s: &str, max_len: usize) -> String {
-    truncate_with_ellipsis(s, max_len)
-}
-
 /// ANSI color codes for terminal output.
 pub mod colors {
     pub const RESET: &str = "\x1b[0m";
