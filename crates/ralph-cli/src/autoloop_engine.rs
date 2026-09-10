@@ -85,8 +85,13 @@ pub async fn run_autoloop_engine(
         }
     };
 
-    // The prompt comes from the canonical normalized field.
-    let prompt = {
+    // The prompt comes from the canonical field: an inline prompt (from `-p`,
+    // held in `config.event_loop.prompt` by `run_command`) takes precedence over
+    // a prompt file. This matters for `--rpc`, where `LoopStarted.prompt` is
+    // protocol-visible — dropping an inline `-p` would surface an empty prompt.
+    let prompt = if let Some(p) = config.event_loop.prompt.clone() {
+        p
+    } else {
         let pf = config.event_loop.prompt_file.clone();
         if pf.trim().is_empty() {
             String::new()
@@ -196,6 +201,9 @@ pub async fn run_autoloop_engine(
         auto_merge,
         &loop_id,
         use_colors,
+        // In RPC mode stdout is the protocol channel — the banner's content is
+        // already delivered as the LoopTerminated event.
+        !rpc,
     );
 
     Ok(reason)
@@ -352,6 +360,18 @@ fn emit_rpc(event: &ralph_proto::json_rpc::RpcEvent) {
 /// terminal `loop.finish` synchronously just before exit, so after the wait task
 /// signals completion the reader performs one final `poll()` (plus a
 /// `finalize()`) to capture it.
+///
+/// ## Cancel / control
+///
+/// The child is spawned as its own process-group leader. A cancel — SIGINT,
+/// SIGTERM, or an `abort` RpcCommand on stdin — kills the whole autoloop
+/// subtree (`kill_autoloop_group`: SIGTERM, then SIGKILL) so the backend agent
+/// is not orphaned, and if autoloop never wrote an authoritative terminal a
+/// synthesized `LoopTerminated { reason: Interrupted, ... }` closes the stream
+/// so the RPC protocol always ends well-formed. Other RpcCommand variants
+/// (guidance / steer / follow-up / get-state / set-hat) are consumed and
+/// ignored for now: they require an in-loop agent channel that the autoloop
+/// engine path does not expose yet (#345).
 async fn run_autoloop_with_rpc(
     runner: AutoloopRunner,
     events_path: PathBuf,
@@ -362,7 +382,8 @@ async fn run_autoloop_with_rpc(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ralph_proto::json_rpc::RpcEvent;
+    use ralph_proto::json_rpc::{RpcCommand, RpcEvent, parse_command};
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::sync::watch;
 
     let started_at = now_unix_millis();
@@ -377,7 +398,69 @@ async fn run_autoloop_with_rpc(
     // Signals subprocess completion so the reader stops tailing and does its
     // final drain.
     let (done_tx, mut done_rx) = watch::channel(false);
-    let child = runner.spawn().context("spawning the autoloop subprocess")?;
+    // Signals a cancel (SIGINT/SIGTERM or an RPC `abort` command on stdin) so we
+    // kill the whole autoloop subtree, mirroring `run_autoloop_with_tui`.
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+
+    // Spawn as its own process-group leader so a cancel can kill the entire tree
+    // (autoloop + backend agent) rather than orphaning the agent. Rebind `runner`
+    // (mirroring `run_autoloop_with_tui`) so `wait_with_summary` below uses the
+    // process-grouped instance.
+    let runner = runner.own_process_group(true);
+    let child = runner
+        .spawn()
+        .context("spawning the autoloop subprocess")?;
+    let child_pid = child.id();
+
+    // SIGINT/SIGTERM → cancel. RPC mode is a protocol channel, not a human tty,
+    // so the default "die on SIGINT" is replaced by a graceful kill of the
+    // subtree + a terminal event (the TUI path does the same via q/Ctrl+C).
+    #[cfg(unix)]
+    {
+        let tx = cancel_tx.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = sigint.recv() => {
+                    let _ = tx.send(true);
+                }
+                _ = sigterm.recv() => {
+                    let _ = tx.send(true);
+                }
+            }
+        });
+    }
+    // JSON-RPC commands arrive on stdin as one JSON object per line. Only
+    // `abort` drives cancel here; the other variants (guidance/steer/follow-up/
+    // get-state/set-hat) require an active in-loop agent channel that the
+    // autoloop engine path does not expose yet (see #345) — they are consumed
+    // (acked) and otherwise ignored.
+    let tx = cancel_tx.clone();
+    tokio::spawn(async move {
+        let stdin = tokio::io::stdin();
+        let mut lines = BufReader::new(stdin).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            match parse_command(line) {
+                Ok(RpcCommand::Abort { .. }) => {
+                    let _ = tx.send(true);
+                }
+                Ok(_) => {
+                    tracing::debug!(command = line, "RPC command consumed (no live channel; ignored)");
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, line, "malformed RPC command line; ignoring");
+                }
+            }
+        }
+    });
 
     let completed = Arc::new(AtomicBool::new(false));
     let wait_handle = {
@@ -397,13 +480,20 @@ async fn run_autoloop_with_rpc(
     let mut tailer = AutoloopEventTailer::new(&events_path);
     let mut mapper = AutoloopRpcMapper::new(started_at, backend);
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
-    loop {
+    ticker.tick().await; // first tick completes immediately; skip it
+    let cancelled = loop {
         tokio::select! {
             biased;
 
             _ = done_rx.changed() => {
                 if *done_rx.borrow() {
-                    break;
+                    break false;
+                }
+            }
+
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    break true;
                 }
             }
 
@@ -411,6 +501,13 @@ async fn run_autoloop_with_rpc(
                 drain_rpc_events(&mut tailer, &mut mapper);
             }
         }
+    };
+
+    // If the run was cancelled before autoloop wrote its own terminal, kill the
+    // whole subtree so the backend agent is not orphaned. (No-op if autoloop
+    // already exited on its own.)
+    if cancelled && !mapper.saw_terminal() {
+        kill_autoloop_group(child_pid);
     }
 
     // Final drain: capture the terminal loop.finish written just before exit,
@@ -419,8 +516,22 @@ async fn run_autoloop_with_rpc(
     if let Some(terminal) = mapper.finalize() {
         emit_rpc(&terminal);
     }
+    // On cancel where autoloop didn't emit an authoritative terminal of its own,
+    // synthesize one so the RPC stream always ends well-formed.
+    if cancelled && !mapper.saw_terminal() {
+        let terminated_at = now_unix_millis();
+        emit_rpc(&RpcEvent::LoopTerminated {
+            reason: ralph_proto::json_rpc::TerminationReason::Interrupted,
+            total_iterations: 0,
+            duration_ms: terminated_at.saturating_sub(started_at),
+            total_cost_usd: 0.0,
+            terminated_at,
+        });
+    }
 
-    wait_handle.await.context("autoloop wait join failed")?
+    wait_handle
+        .await
+        .context("autoloop wait join failed")?
 }
 
 /// Poll the tailer once and emit every translated [`RpcEvent`] to stdout.

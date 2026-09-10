@@ -32,6 +32,11 @@ use crate::display::print_termination;
 /// `state` carries the iteration count / elapsed time surfaced by whichever
 /// engine ran the loop. `context` is `None` only for ad-hoc runs with no loop
 /// identity (no merge-queue / registry participation in that case).
+///
+/// `console` gates the human-readable termination banner. In `--rpc` mode
+/// stdout is the protocol channel (JSON-lines `RpcEvent` stream), so callers
+/// pass `false` to keep it clean — the banner's information is already carried
+/// by the `LoopTerminated` event.
 #[allow(clippy::too_many_arguments)]
 pub fn coordinate_completion(
     reason: &TerminationReason,
@@ -42,6 +47,7 @@ pub fn coordinate_completion(
     auto_merge: bool,
     loop_id: &str,
     use_colors: bool,
+    console: bool,
 ) {
     let repo_root = context
         .map(|c| c.repo_root().to_path_buf())
@@ -139,8 +145,11 @@ pub fn coordinate_completion(
         }
     }
 
-    // 7. Console termination banner.
-    print_termination(reason, state, use_colors, Some(loop_id));
+    // 7. Console termination banner (skipped in RPC mode, where stdout is the
+    // protocol channel and LoopTerminated already carries this information).
+    if console {
+        print_termination(reason, state, use_colors, Some(loop_id));
+    }
 }
 
 #[cfg(test)]
@@ -173,6 +182,7 @@ mod tests {
             false,
             "test-loop",
             false,
+            true,
         );
     }
 }

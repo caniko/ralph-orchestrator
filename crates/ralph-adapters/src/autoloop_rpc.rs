@@ -37,9 +37,16 @@ fn now_unix_millis() -> u64 {
 /// how the in-house engine surfaced non-clean exits over `--rpc`.
 fn map_stop_reason(reason: &str) -> TerminationReason {
     match reason {
-        "completed" | "verdict_exit" => TerminationReason::Completed,
+        // A successful completion, whatever autoloop's specific flavor:
+        // `completed`, `completion_promise`, `completion_event`, or
+        // `verdict_exit` all mean the loop finished on its own terms.
+        "completed" | "completion_promise" | "completion_event" | "verdict_exit" => {
+            TerminationReason::Completed
+        }
         "max_iterations" => TerminationReason::MaxIterations,
         "interrupted" => TerminationReason::Interrupted,
+        // `stalled`, `max_runtime`, `cost_budget`, `backend_failed`, … collapse
+        // onto Error (no closer proto variant exists).
         _ => TerminationReason::Error,
     }
 }

@@ -90,4 +90,119 @@ impl TerminationReason {
     pub fn is_success(&self) -> bool {
         matches!(self, TerminationReason::CompletionPromise)
     }
+
+    /// Machine-readable label recorded in loop history on completion
+    /// (`loop_history.record_completed`). Note the `CompletionPromise` arm is
+    /// `"completion_promise"` (not `as_str`'s `"completed"`): the history keeps
+    /// the raw variant name, while `as_str` is the loop.terminate event payload
+    /// vocabulary.
+    pub fn history_label(&self) -> &'static str {
+        match self {
+            TerminationReason::CompletionPromise => "completion_promise",
+            TerminationReason::MaxIterations => "max_iterations",
+            TerminationReason::MaxRuntime => "max_runtime",
+            TerminationReason::MaxCost => "max_cost",
+            TerminationReason::ConsecutiveFailures => "consecutive_failures",
+            TerminationReason::LoopThrashing => "loop_thrashing",
+            TerminationReason::LoopStale => "loop_stale",
+            TerminationReason::ValidationFailure => "validation_failure",
+            TerminationReason::Stopped => "stopped",
+            TerminationReason::Interrupted => "interrupted",
+            TerminationReason::RestartRequested => "restart_requested",
+            TerminationReason::WorkspaceGone => "workspace_gone",
+            TerminationReason::Cancelled => "cancelled",
+        }
+    }
+
+    /// Human-readable description recorded when a non-completing merge loop
+    /// needs review.
+    pub fn review_description(&self) -> &'static str {
+        match self {
+            TerminationReason::CompletionPromise => "completed",
+            TerminationReason::MaxIterations => "max iterations reached",
+            TerminationReason::MaxRuntime => "max runtime exceeded",
+            TerminationReason::MaxCost => "max cost exceeded",
+            TerminationReason::ConsecutiveFailures => "consecutive failures",
+            TerminationReason::LoopThrashing => "loop thrashing detected",
+            TerminationReason::LoopStale => "stale loop detected",
+            TerminationReason::ValidationFailure => "validation failure",
+            TerminationReason::Stopped => "manually stopped",
+            TerminationReason::Interrupted => "interrupted by signal",
+            TerminationReason::RestartRequested => "restart requested",
+            TerminationReason::WorkspaceGone => "workspace directory removed",
+            TerminationReason::Cancelled => "cancelled by human",
+        }
+    }
+}
+
+/// Human-readable rendering of a termination reason (e.g. for logging fields).
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.review_description())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn history_label_matches_variant_names() {
+        // Everything except CompletionPromise mirrors `as_str` (snake_case
+        // variant name); CompletionPromise is spelled out as
+        // `completion_promise` in the history (see the method doc).
+        for r in [
+            TerminationReason::MaxIterations,
+            TerminationReason::MaxRuntime,
+            TerminationReason::MaxCost,
+            TerminationReason::ConsecutiveFailures,
+            TerminationReason::LoopThrashing,
+            TerminationReason::LoopStale,
+            TerminationReason::ValidationFailure,
+            TerminationReason::Stopped,
+            TerminationReason::Interrupted,
+            TerminationReason::RestartRequested,
+            TerminationReason::WorkspaceGone,
+            TerminationReason::Cancelled,
+        ] {
+            assert_eq!(r.history_label(), r.as_str());
+        }
+        assert_eq!(
+            TerminationReason::CompletionPromise.history_label(),
+            "completion_promise"
+        );
+    }
+
+    #[test]
+    fn review_description_and_display_cover_all_reasons() {
+        let max_iter = TerminationReason::MaxIterations.review_description();
+        assert_eq!(max_iter, "max iterations reached");
+        assert_eq!(
+            TerminationReason::MaxIterations.to_string(),
+            "max iterations reached",
+            "Display delegates to review_description"
+        );
+        assert_eq!(
+            TerminationReason::CompletionPromise.to_string(),
+            "completed"
+        );
+        // No reason should be a blank description.
+        for r in [
+            TerminationReason::CompletionPromise,
+            TerminationReason::MaxIterations,
+            TerminationReason::MaxRuntime,
+            TerminationReason::MaxCost,
+            TerminationReason::ConsecutiveFailures,
+            TerminationReason::LoopThrashing,
+            TerminationReason::LoopStale,
+            TerminationReason::ValidationFailure,
+            TerminationReason::Stopped,
+            TerminationReason::Interrupted,
+            TerminationReason::RestartRequested,
+            TerminationReason::WorkspaceGone,
+            TerminationReason::Cancelled,
+        ] {
+            assert!(!r.review_description().is_empty());
+        }
+    }
 }
