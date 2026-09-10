@@ -28,6 +28,11 @@
 
 mod acp_executor;
 mod auto_detect;
+pub mod autoloop_event_tailer;
+pub mod autoloop_events;
+pub mod autoloop_journal;
+pub mod autoloop_rpc;
+mod autoloop_runner;
 mod claude_stream;
 mod cli_backend;
 mod cli_executor;
@@ -42,6 +47,19 @@ pub mod tool_preview;
 pub use acp_executor::AcpExecutor;
 pub use auto_detect::{
     DEFAULT_PRIORITY, NoBackendError, detect_backend, detect_backend_default, is_backend_available,
+};
+pub use autoloop_event_tailer::AutoloopEventTailer;
+pub use autoloop_events::{
+    AutoloopEvent, PendingAsk, RunResult, first_pending_ask, parse_events,
+    run_result as events_run_result,
+};
+pub use autoloop_rpc::AutoloopRpcMapper;
+pub use autoloop_journal::{
+    AutoloopJournalTailer, AutoloopRecord, JournalError, JournalReplay, LiveRunState, RunSummary,
+    TailError, derive_run_summary, replay_journal,
+};
+pub use autoloop_runner::{
+    AutoloopBin, AutoloopRunError, AutoloopRunSummary, AutoloopRunner, parse_summary,
 };
 pub use claude_stream::{
     AssistantMessage, ClaudeStreamEvent, ClaudeStreamParser, ContentBlock, Usage, UserContentBlock,

@@ -17,6 +17,10 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod autoloop_engine;
+mod autoloop_preset_gen;
+mod completion_coord;
+mod merge_processing;
 mod backend_support;
 mod bot;
 mod config_resolution;
@@ -26,20 +30,17 @@ mod hats;
 mod hooks;
 mod init;
 mod interact;
-mod loop_runner;
 mod loops;
 mod mcp;
 mod memory;
 mod preflight;
 mod presets;
-mod rpc_stdin;
 mod skill_cli;
 mod sop_runner;
 mod task_cli;
 #[cfg(test)]
 mod test_support;
 mod tools;
-mod wave;
 mod web;
 mod web_robot_service;
 
@@ -56,73 +57,6 @@ use std::fs;
 use std::io::{IsTerminal, Write, stdout};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
-
-// Unix-specific process management for process group leadership
-#[cfg(unix)]
-mod process_management {
-    use nix::unistd::{Pid, getpgrp, setpgid, tcgetpgrp};
-    use std::io::{IsTerminal, stdin, stdout};
-    use tracing::debug;
-
-    /// Sets up process group leadership.
-    ///
-    /// Per spec: "The orchestrator must run as a process group leader. All spawned
-    /// CLI processes (Claude, Kiro, etc.) belong to this group. On termination,
-    /// the entire process group receives the signal, preventing orphans."
-    pub fn setup_process_group() {
-        // Make ourselves the process group leader when safe.
-        // If we're launched by a wrapper (e.g., `npx`), moving to a new process
-        // group can drop us out of the foreground TTY group and break TUI input.
-        let pid = Pid::this();
-        let pgrp = getpgrp();
-        if pgrp == pid {
-            debug!("Already process group leader: PID {}", pid);
-            return;
-        }
-
-        if is_foreground_tty_group(pgrp) {
-            debug!(
-                "Skipping setpgid: keeping foreground process group {}",
-                pgrp
-            );
-            return;
-        }
-
-        if let Err(e) = setpgid(pid, pid) {
-            // EPERM is OK - we're already a process group leader (e.g., started from shell)
-            if e != nix::errno::Errno::EPERM {
-                debug!(
-                    "Note: Could not set process group ({}), continuing anyway",
-                    e
-                );
-            }
-        }
-        debug!("Process group initialized: PID {}", pid);
-    }
-
-    fn is_foreground_tty_group(current_pgrp: Pid) -> bool {
-        // Prefer stdin for foreground checks, fall back to stdout.
-        if stdin().is_terminal()
-            && let Ok(fg) = tcgetpgrp(stdin())
-        {
-            return fg == current_pgrp;
-        }
-
-        if stdout().is_terminal()
-            && let Ok(fg) = tcgetpgrp(stdout())
-        {
-            return fg == current_pgrp;
-        }
-
-        false
-    }
-}
-
-#[cfg(not(unix))]
-mod process_management {
-    /// No-op on non-Unix platforms.
-    pub fn setup_process_group() {}
-}
 
 /// Installs a panic hook that restores terminal state before printing panic info.
 ///
@@ -237,58 +171,6 @@ fn resolve_marker_target(workspace_root: &Path, marker_value: &str) -> PathBuf {
     }
 }
 
-/// Verbosity level for streaming output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Verbosity {
-    /// Suppress all streaming output (for CI/scripting)
-    Quiet,
-    /// Show assistant text and tool invocations (default)
-    #[default]
-    Normal,
-    /// Show everything including tool results and session summary
-    Verbose,
-}
-
-impl Verbosity {
-    /// Resolves verbosity from CLI args, env vars, and config.
-    ///
-    /// Precedence (highest to lowest):
-    /// 1. CLI flags: `--verbose`/`-v` or `--quiet`/`-q`
-    /// 2. Environment variables: `RALPH_VERBOSE=1` or `RALPH_QUIET=1`
-    /// 3. Config file: (if supported in future)
-    /// 4. Default: Normal
-    fn resolve(cli_verbose: bool, cli_quiet: bool) -> Self {
-        let env_quiet = std::env::var("RALPH_QUIET").is_ok();
-        let env_verbose = std::env::var("RALPH_VERBOSE").is_ok();
-        Self::resolve_with_env(cli_verbose, cli_quiet, env_quiet, env_verbose)
-    }
-
-    #[allow(clippy::fn_params_excessive_bools)]
-    fn resolve_with_env(
-        cli_verbose: bool,
-        cli_quiet: bool,
-        env_quiet: bool,
-        env_verbose: bool,
-    ) -> Self {
-        // CLI flags take precedence
-        if cli_quiet {
-            return Verbosity::Quiet;
-        }
-        if cli_verbose {
-            return Verbosity::Verbose;
-        }
-
-        // Environment variables
-        if env_quiet {
-            return Verbosity::Quiet;
-        }
-        if env_verbose {
-            return Verbosity::Verbose;
-        }
-
-        Verbosity::Normal
-    }
-}
 
 /// Output format for events command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
@@ -348,7 +230,10 @@ impl ConfigSource {
         }
     }
 
-    /// Convert back to CLI string representation for forwarding to subprocess.
+    /// Convert back to CLI string representation (e.g. for forwarding to a
+    /// subprocess). Retained as tested config plumbing; the in-house engine's
+    /// subprocess-forwarding caller was removed in the v3 cutover.
+    #[allow(dead_code)]
     fn to_cli_string(&self) -> String {
         match self {
             ConfigSource::File(path) => path.display().to_string(),
@@ -435,38 +320,45 @@ pub(crate) fn is_toml_preset_dir(path: &Path) -> bool {
     path.is_dir() && path.join("autoloops.toml").is_file() && path.join("topology.toml").is_file()
 }
 
-/// Search for a TOML preset dir named `name`.
+/// Ordered preset root directories resolved from the environment.
 ///
-/// Resolution order, first hit wins:
-/// 1. `./presets/<name>/` (project-local)
-/// 2. `$XDG_CONFIG_HOME/ralph/presets/<name>/` (user, canonical)
-/// 3. `$HOME/.config/ralph/presets/<name>/` (user, fallback for #2)
-/// 4. `$HOME/.config/autoloop/presets/<name>/` (shared with autoloop CLI)
-/// 5. `$RALPH_PRESETS_DIR/<name>/` (explicit override)
-/// 6. `$AUTOLOOP_PRESETS_DIR/<name>/` (deprecated alias for #5)
-///
-/// Returns `None` if no candidate directory exists and matches the preset shape.
-pub(crate) fn resolve_preset_dir(name: &str) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// 1. `./presets/` (project-local)
+/// 2. `$XDG_CONFIG_HOME/ralph/presets/` (user, canonical)
+/// 3. `$HOME/.config/ralph/presets/` (user, fallback for #2)
+/// 4. `$HOME/.config/autoloop/presets/` (shared with autoloop CLI; back-compat)
+/// 5. `$RALPH_PRESETS_DIR/` (explicit override)
+/// 6. `$AUTOLOOP_PRESETS_DIR/` (deprecated alias for #5)
+pub(crate) fn preset_search_roots() -> Vec<(&'static str, PathBuf)> {
+    let mut roots: Vec<(&'static str, PathBuf)> = Vec::new();
 
-    candidates.push(PathBuf::from("presets").join(name));
-
+    roots.push(("project", PathBuf::from("presets")));
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        candidates.push(PathBuf::from(xdg).join("ralph/presets").join(name));
+        roots.push(("xdg", PathBuf::from(xdg).join("ralph/presets")));
     }
     if let Ok(home) = std::env::var("HOME") {
         let home = PathBuf::from(home);
-        candidates.push(home.join(".config/ralph/presets").join(name));
-        candidates.push(home.join(".config/autoloop/presets").join(name));
+        roots.push(("home", home.join(".config/ralph/presets")));
+        roots.push(("autoloop", home.join(".config/autoloop/presets")));
     }
     if let Ok(explicit) = std::env::var("RALPH_PRESETS_DIR") {
-        candidates.push(PathBuf::from(explicit).join(name));
+        roots.push(("env", PathBuf::from(explicit)));
     }
     if let Ok(explicit) = std::env::var("AUTOLOOP_PRESETS_DIR") {
-        candidates.push(PathBuf::from(explicit).join(name));
+        roots.push(("env", PathBuf::from(explicit)));
     }
 
-    candidates.into_iter().find(|p| is_toml_preset_dir(p))
+    roots
+}
+
+/// Search for a TOML preset dir named `name`.
+///
+/// First hit across [`preset_search_roots`] wins.
+/// Returns `None` if no candidate directory matches the preset shape.
+pub(crate) fn resolve_preset_dir(name: &str) -> Option<PathBuf> {
+    preset_search_roots()
+        .into_iter()
+        .map(|(_, root)| root.join(name))
+        .find(|p| is_toml_preset_dir(p))
 }
 
 /// Known core fields that can be overridden via CLI.
@@ -681,9 +573,6 @@ enum Commands {
 
     /// Ralph's runtime tools (agent-facing)
     Tools(tools::ToolsArgs),
-
-    /// Dispatch wave events for parallel hat execution
-    Wave(wave::WaveArgs),
 
     /// Manage parallel loops
     Loops(loops::LoopsArgs),
@@ -1255,7 +1144,6 @@ async fn main() -> Result<()> {
             code_task_command(&config_sources, hats_source.as_ref(), cli.color, args).await
         }
         Some(Commands::Tools(args)) => tools::execute(args, cli.color.should_use_colors()).await,
-        Some(Commands::Wave(args)) => wave::execute(args, cli.color.should_use_colors()),
         Some(Commands::Loops(args)) => loops::execute(args, cli.color.should_use_colors()),
         Some(Commands::Hats(args)) => {
             hats::execute(
@@ -1496,9 +1384,6 @@ async fn run_command(
         );
     }
 
-    // Capture args for subprocess TUI mode BEFORE fields are consumed below
-    let subprocess_tui_args = SubprocessTuiArgs::new(&args, config_sources, hats_source);
-
     // Apply CLI overrides (after normalization so they take final precedence)
     // Per spec: CLI -p and -P are mutually exclusive (enforced by clap)
     if let Some(text) = args.prompt_text {
@@ -1646,24 +1531,10 @@ async fn run_command(
 
     let mut pending_worktree_registration: Option<LoopEntry> = None;
 
-    // Determine TUI mode early (before lock acquisition) to avoid self-lock contention
-    // in subprocess TUI mode. The child RPC process will acquire the lock itself.
-    let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let use_subprocess_tui =
-        !args.no_tui && !args.autonomous && !args.rpc && !args.legacy_tui && is_tty;
-
-    // Try to acquire the loop lock for multi-loop concurrency support
-    // This implements the lock detection flow from the multi-loop spec
-    // Skip lock acquisition in subprocess TUI mode - let the child acquire it
+    // Try to acquire the loop lock for multi-loop concurrency support.
+    // This implements the lock detection flow from the multi-loop spec.
     let workspace_root = &config.core.workspace_root;
-    let (loop_context, _lock_guard) = if use_subprocess_tui {
-        // In subprocess TUI mode, don't acquire lock here - the child RPC process will do it
-        // This avoids the self-lock contention where parent holds lock and child sees it,
-        // then incorrectly spawns a worktree thinking there's another concurrent loop
-        debug!("Skipping lock acquisition in subprocess TUI mode (child will acquire)");
-        let context = LoopContext::primary(workspace_root.clone());
-        (context, None)
-    } else {
+    let (loop_context, _lock_guard) = {
         match LoopLock::try_acquire(workspace_root, &prompt_summary) {
             Ok(guard) => {
                 // We're the primary loop - run in place
@@ -1816,13 +1687,7 @@ async fn run_command(
             .context("Failed to register loop in registry")?;
     }
 
-    // Run the orchestration loop and exit with proper exit code
-    // TUI is enabled by default (unless --no-tui, --autonomous, or --rpc is specified)
-    let wants_tui = !args.no_tui && !args.autonomous && !args.rpc;
-    let use_legacy_tui = args.legacy_tui;
-    let enable_rpc = args.rpc;
-    let verbosity = Verbosity::resolve(verbose || args.verbose, args.quiet);
-    let custom_args = args.custom_args.clone();
+    // Run the orchestration loop and exit with proper exit code.
     // --no-auto-merge CLI flag overrides config.features.auto_merge
     let auto_merge_override = if args.no_auto_merge {
         Some(false)
@@ -1831,33 +1696,26 @@ async fn run_command(
     };
     let workspace_root = config.core.workspace_root.clone();
 
-    // Determine TUI mode:
-    // 1. Subprocess TUI (default): TUI spawns `ralph run --rpc` as child, reads JSON events
-    // 2. Legacy TUI: In-process TUI (--legacy-tui escape hatch)
-    // 3. RPC mode: Headless JSON-lines output (--rpc)
-    // 4. CLI mode: No TUI (--no-tui or --autonomous)
-    // Note: use_subprocess_tui is now determined earlier (before lock acquisition)
-    let reason = if use_subprocess_tui {
-        // Subprocess TUI mode: spawn child with --rpc and attach TUI
-        run_subprocess_tui(subprocess_tui_args, resume, custom_args).await?
-    } else {
-        // In-process mode: run_loop_impl handles everything
-        let enable_tui = wants_tui && use_legacy_tui;
-        loop_runner::run_loop_impl(
-            config,
-            color_mode,
-            resume,
-            enable_tui,
-            enable_rpc,
-            verbosity,
-            args.record_session,
-            Some(loop_context),
-            custom_args,
-            auto_merge_override,
-            args.loop_id,
-        )
-        .await?
-    };
+    // v3 cutover: the autoloop runtime is the sole orchestration engine. ralph
+    // spawns `autoloop run` as a subprocess, consumes its event stream, and runs
+    // the engine-agnostic completion coordination (merge queue, registry,
+    // landing) so parallel loops keep working.
+    //
+    // The legacy in-house engine paths (subprocess TUI, --rpc, --legacy-tui) are
+    // descoped: see #342 (TUI) and #343 (RPC).
+    // TUI is the default unless --no-tui, --autonomous, or --rpc was given
+    // (same predicate the logging setup uses at startup).
+    let wants_tui = !args.no_tui && !args.autonomous && !args.rpc;
+    let reason = autoloop_engine::run_autoloop_engine(
+        config,
+        Some(loop_context),
+        auto_merge_override,
+        args.loop_id.clone(),
+        color_mode.should_use_colors(),
+        wants_tui,
+        args.rpc,
+    )
+    .await?;
 
     // Handle restart: run required single-command restart sequence.
     if matches!(reason, TerminationReason::RestartRequested) {
@@ -1904,252 +1762,6 @@ fn required_restart_command(pid: u32) -> String {
 fn clear_restart_request_signal(workspace_root: &std::path::Path) {
     let restart_path = workspace_root.join(".ralph/restart-requested");
     let _ = std::fs::remove_file(&restart_path);
-}
-
-/// Arguments needed for subprocess TUI mode.
-/// We clone these early before RunArgs fields are consumed.
-#[derive(Clone)]
-struct SubprocessTuiArgs {
-    prompt_text: Option<String>,
-    prompt_file: Option<PathBuf>,
-    backend: Option<String>,
-    max_iterations: Option<u32>,
-    completion_promise: Option<String>,
-    continue_mode: bool,
-    loop_id: Option<String>,
-    idle_timeout: Option<u32>,
-    verbose: bool,
-    quiet: bool,
-    record_session: Option<PathBuf>,
-    exclusive: bool,
-    no_auto_merge: bool,
-    skip_preflight: bool,
-    /// Config sources to forward to child process (-c args)
-    config_sources: Vec<String>,
-    /// Hats source to forward to child process (-H arg)
-    hats_source: Option<String>,
-}
-
-impl SubprocessTuiArgs {
-    /// Create from RunArgs with config/hats sources from Cli.
-    fn new(
-        args: &RunArgs,
-        config_sources: &[ConfigSource],
-        hats_source: Option<&HatsSource>,
-    ) -> Self {
-        Self {
-            prompt_text: args.prompt_text.clone(),
-            prompt_file: args.prompt_file.clone(),
-            backend: args.backend.clone(),
-            max_iterations: args.max_iterations,
-            completion_promise: args.completion_promise.clone(),
-            continue_mode: args.continue_mode,
-            loop_id: args.loop_id.clone(),
-            idle_timeout: args.idle_timeout,
-            verbose: args.verbose,
-            quiet: args.quiet,
-            record_session: args.record_session.clone(),
-            exclusive: args.exclusive,
-            no_auto_merge: args.no_auto_merge,
-            skip_preflight: args.skip_preflight,
-            config_sources: config_sources.iter().map(|s| s.to_cli_string()).collect(),
-            hats_source: hats_source.map(|h| h.label()),
-        }
-    }
-}
-
-/// Run the orchestration loop as a subprocess with TUI attached.
-///
-/// This spawns `ralph run --rpc` as a child process and attaches the TUI
-/// as a client that reads JSON events from stdout and sends commands to stdin.
-/// This two-process model allows the TUI to be decoupled from the orchestration loop.
-async fn run_subprocess_tui(
-    args: SubprocessTuiArgs,
-    resume: bool,
-    custom_args: Vec<String>,
-) -> Result<TerminationReason> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
-    // Build child command: ralph [-c ...] [-H ...] run --rpc <forwarded args>
-    // Note: -c and -H are global options that must come BEFORE the subcommand
-    let mut child_args = Vec::new();
-
-    // Forward config sources (global option, before subcommand)
-    for config_source in &args.config_sources {
-        child_args.push("-c".to_string());
-        child_args.push(config_source.clone());
-    }
-
-    // Forward hats source (global option, before subcommand)
-    if let Some(ref hats) = args.hats_source {
-        child_args.push("-H".to_string());
-        child_args.push(hats.clone());
-    }
-
-    // Add subcommand and mode
-    child_args.push("run".to_string());
-    child_args.push("--rpc".to_string());
-
-    // Forward prompt
-    if let Some(ref prompt) = args.prompt_text {
-        child_args.push("-p".to_string());
-        child_args.push(prompt.clone());
-    }
-    if let Some(ref prompt_file) = args.prompt_file {
-        child_args.push("-P".to_string());
-        child_args.push(prompt_file.to_string_lossy().to_string());
-    }
-
-    // Forward backend
-    if let Some(ref backend) = args.backend {
-        child_args.push("-b".to_string());
-        child_args.push(backend.clone());
-    }
-
-    // Forward max iterations
-    if let Some(max_iters) = args.max_iterations {
-        child_args.push("--max-iterations".to_string());
-        child_args.push(max_iters.to_string());
-    }
-
-    // Forward completion promise
-    if let Some(ref promise) = args.completion_promise {
-        child_args.push("--completion-promise".to_string());
-        child_args.push(promise.clone());
-    }
-
-    // Forward continue mode and loop ID
-    if resume || args.continue_mode {
-        child_args.push("--continue".to_string());
-    }
-    if let Some(ref loop_id) = args.loop_id {
-        child_args.push("--loop-id".to_string());
-        child_args.push(loop_id.clone());
-    }
-
-    // Forward idle timeout
-    if let Some(timeout) = args.idle_timeout {
-        child_args.push("--idle-timeout".to_string());
-        child_args.push(timeout.to_string());
-    }
-
-    // Forward verbosity
-    if args.verbose {
-        child_args.push("-v".to_string());
-    }
-    if args.quiet {
-        child_args.push("-q".to_string());
-    }
-
-    // Forward record session
-    if let Some(ref path) = args.record_session {
-        child_args.push("--record-session".to_string());
-        child_args.push(path.to_string_lossy().to_string());
-    }
-
-    // Forward multi-loop options
-    if args.exclusive {
-        child_args.push("--exclusive".to_string());
-    }
-    if args.no_auto_merge {
-        child_args.push("--no-auto-merge".to_string());
-    }
-
-    // Forward preflight options
-    if args.skip_preflight {
-        child_args.push("--skip-preflight".to_string());
-    }
-
-    // Forward custom args (after --)
-    if !custom_args.is_empty() {
-        child_args.push("--".to_string());
-        child_args.extend(custom_args);
-    }
-
-    info!(child_args = ?child_args, "Spawning subprocess for TUI mode");
-
-    // Spawn child process.
-    // Redirect stderr to a log file to prevent child tracing output from
-    // corrupting the TUI display (ratatui runs in raw terminal mode).
-    let stderr_stdio = match ralph_core::diagnostics::create_log_file(
-        &std::env::current_dir().unwrap_or_default(),
-    ) {
-        Ok((file, path)) => {
-            info!(log_file = %path.display(), "TUI subprocess stderr redirected to log file");
-            Stdio::from(file)
-        }
-        Err(_) => Stdio::null(),
-    };
-
-    let mut child = Command::new(std::env::current_exe()?)
-        .args(&child_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(stderr_stdio)
-        .spawn()
-        .context("Failed to spawn ralph subprocess for TUI")?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .context("Failed to capture subprocess stdin")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Failed to capture subprocess stdout")?;
-
-    // Create TUI state and start event reader
-    let state = std::sync::Arc::new(std::sync::Mutex::new(ralph_tui::TuiState::new()));
-    let (terminated_tx, terminated_rx) = tokio::sync::watch::channel(false);
-
-    // Create RPC writer for sending commands
-    let rpc_writer = ralph_tui::RpcWriter::new(stdin);
-
-    // Spawn the event reader as a background task
-    let reader_state = std::sync::Arc::clone(&state);
-    let cancel_rx = terminated_rx.clone();
-    let reader_handle = tokio::spawn(async move {
-        ralph_tui::run_rpc_event_reader(stdout, reader_state, cancel_rx).await;
-    });
-
-    info!("TUI running in subprocess RPC mode");
-
-    // Run the TUI render/input loop with subprocess support
-    let app = ralph_tui::App::new_subprocess(
-        std::sync::Arc::clone(&state),
-        terminated_rx,
-        rpc_writer.clone(),
-    );
-    let tui_result = app.run().await;
-
-    // Signal cancellation
-    let _ = terminated_tx.send(true);
-
-    // Send abort to subprocess and close stdin
-    let _ = rpc_writer.send_abort().await;
-    let _ = rpc_writer.close().await;
-
-    // Wait for reader to finish
-    let _ = reader_handle.await;
-
-    // Wait for subprocess to exit and get exit status
-    let exit_status = child.wait().await?;
-
-    // Map exit status to termination reason
-    // Exit codes: 0=success, 1=max_iterations, 130=interrupted (SIGINT)
-    let reason = if exit_status.success() {
-        TerminationReason::CompletionPromise
-    } else {
-        match exit_status.code() {
-            Some(1) => TerminationReason::MaxIterations,
-            Some(130) => TerminationReason::Interrupted,
-            _ => TerminationReason::Stopped,
-        }
-    };
-
-    // Return TUI result if it failed, otherwise the termination reason
-    tui_result.map(|_| reason)
 }
 
 /// Resume a previously interrupted loop from existing scratchpad.
@@ -2239,25 +1851,18 @@ async fn resume_command(
         }
     }
 
-    // Run the orchestration loop in resume mode
-    // The key difference: we publish task.resume instead of task.start,
-    // signaling the planner to read the existing scratchpad
-    // TUI is enabled by default (unless --no-tui, --autonomous, or --rpc is specified)
-    let enable_tui = !args.no_tui && !args.autonomous && !args.rpc;
-    let enable_rpc = args.rpc;
-    let verbosity = Verbosity::resolve(verbose || args.verbose, args.quiet);
-    let reason = loop_runner::run_loop_impl(
+    // v3 cutover: resume re-drives the autoloop engine. A true run_id continue
+    // (resuming autoloop's own loop state) is tracked separately in #344; for now
+    // this restarts the loop reading the existing scratchpad/memories on disk.
+    let wants_tui = !args.no_tui && !args.autonomous && !args.rpc;
+    let reason = autoloop_engine::run_autoloop_engine(
         config,
-        color_mode,
-        true,
-        enable_tui,
-        enable_rpc,
-        verbosity,
-        args.record_session,
-        None,       // Deprecated resume command doesn't have loop_context
-        Vec::new(), // Resume command doesn't support custom args
-        None,       // Use config.features.auto_merge (deprecated command)
-        None,       // Deprecated resume command doesn't support --loop-id
+        None, // Deprecated resume command doesn't carry a loop_context
+        None, // Use config.features.auto_merge (deprecated command)
+        None, // Deprecated resume command doesn't support --loop-id
+        color_mode.should_use_colors(),
+        wants_tui,
+        args.rpc,
     )
     .await?;
     let exit_code = reason.exit_code();
@@ -2320,7 +1925,7 @@ fn init_command(color_mode: ColorMode, args: InitArgs) -> Result<()> {
     println!("Usage:");
     println!("  ralph init --backend <backend>   Generate core config (ralph.yml)");
     println!("  ralph init --list-presets        Show builtin hat collections\n");
-    println!("Backends: {}", backend_support::VALID_BACKENDS_LABEL);
+    println!("Backends: {}", backend_support::valid_backends_label());
     println!("\nThen run with hats, e.g.: ralph run -c ralph.yml -H builtin:code-assist");
 
     Ok(())
@@ -2567,21 +2172,11 @@ fn emit_command_with_root(
         serde_json::Value::String(payload)
     };
 
-    let mut record = serde_json::json!({
+    let record = serde_json::json!({
         "topic": args.topic,
         "payload": payload_value,
         "ts": ts
     });
-
-    // Auto-tag with wave metadata from env vars (set by loop runner on wave workers)
-    if let (Ok(wave_id), Ok(wave_index_str)) = (
-        std::env::var("RALPH_WAVE_ID"),
-        std::env::var("RALPH_WAVE_INDEX"),
-    ) && let Ok(wave_index) = wave_index_str.parse::<u32>()
-    {
-        record["wave_id"] = serde_json::Value::String(wave_id);
-        record["wave_index"] = serde_json::Value::Number(wave_index.into());
-    }
 
     // Resolve events file: RALPH_EVENTS_FILE env > marker file > CLI arg
     // This ensures `ralph emit` writes to the same events file as the active run
@@ -2611,8 +2206,7 @@ fn emit_command_with_root(
         .with_context(|| format!("Failed to open events file: {}", events_file.display()))?;
 
     // Write as single-line JSON (JSONL format)
-    let json_line = serde_json::to_string(&record)?;
-    writeln!(file, "{}", json_line)?;
+    ralph_core::utils::write_jsonl_line(&mut file, &record)?;
 
     // Success message
     if use_colors {
@@ -2932,37 +2526,6 @@ mod tests {
         assert!(
             !restart_path.exists(),
             "restart sentinel should be removed before restart command dispatch"
-        );
-    }
-
-    #[test]
-    fn test_verbosity_cli_quiet() {
-        assert_eq!(Verbosity::resolve(false, true), Verbosity::Quiet);
-    }
-
-    #[test]
-    fn test_verbosity_cli_verbose() {
-        assert_eq!(Verbosity::resolve(true, false), Verbosity::Verbose);
-    }
-
-    #[test]
-    fn test_verbosity_default() {
-        assert_eq!(Verbosity::resolve(false, false), Verbosity::Normal);
-    }
-
-    #[test]
-    fn test_verbosity_env_quiet() {
-        assert_eq!(
-            Verbosity::resolve_with_env(false, false, true, false),
-            Verbosity::Quiet
-        );
-    }
-
-    #[test]
-    fn test_verbosity_env_verbose() {
-        assert_eq!(
-            Verbosity::resolve_with_env(false, false, false, true),
-            Verbosity::Verbose
         );
     }
 

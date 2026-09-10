@@ -28,10 +28,25 @@
 //! }
 //! ```
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::git_ops;
+
+/// The branch prefix used for Ralph worktree branches (e.g., `ralph/loop-id`).
+pub const BRANCH_PREFIX: &str = "ralph/";
+
+/// Returns the branch name for a given loop ID (e.g., `"ralph/my-loop"`).
+pub fn branch_name(loop_id: &str) -> String {
+    format!("{BRANCH_PREFIX}{loop_id}")
+}
+
+/// Extracts the loop ID from a Ralph branch name, if the branch has the prefix.
+pub fn loop_id_from_branch(branch: &str) -> Option<&str> {
+    branch.strip_prefix(BRANCH_PREFIX)
+}
 
 /// Configuration for worktree operations.
 #[derive(Debug, Clone)]
@@ -153,7 +168,7 @@ pub fn create_worktree(
 
     let worktree_base = config.worktree_path(repo_root);
     let worktree_path = worktree_base.join(loop_id);
-    let branch_name = format!("ralph/{loop_id}");
+    let branch_name = branch_name(loop_id);
 
     // Check if worktree already exists
     if worktree_path.exists() {
@@ -200,7 +215,7 @@ pub fn create_worktree(
     }
 
     // Get the HEAD commit
-    let head = get_head_commit(&worktree_path).ok();
+    let head = git_ops::get_head_sha(&worktree_path).ok();
 
     tracing::debug!(
         "Created worktree at {} on branch {} (synced {} untracked, {} modified files)",
@@ -258,7 +273,7 @@ pub fn remove_worktree(
 
     // Delete the branch if it was a ralph/* branch
     if let Some(branch) = branch
-        && branch.starts_with("ralph/")
+        && branch.starts_with(BRANCH_PREFIX)
     {
         let output = Command::new("git")
             .args(["branch", "-D", &branch])
@@ -408,10 +423,7 @@ pub fn ensure_gitignore(
     }
 
     // Append the pattern
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&gitignore_path)?;
+    let mut file = crate::utils::open_append(&gitignore_path)?;
 
     // Add newline before if file exists and doesn't end with newline
     if gitignore_path.exists() {
@@ -445,27 +457,12 @@ fn get_worktree_branch(worktree_path: &Path) -> Option<String> {
     None
 }
 
-/// Get the HEAD commit SHA for a worktree.
-fn get_head_commit(worktree_path: &Path) -> Result<String, WorktreeError> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(worktree_path)
-        .output()?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(WorktreeError::Git(stderr.to_string()))
-    }
-}
-
 /// Get the list of Ralph-specific worktrees (those with `ralph/` branches).
 pub fn list_ralph_worktrees(repo_root: impl AsRef<Path>) -> Result<Vec<Worktree>, WorktreeError> {
     let all = list_worktrees(repo_root)?;
     Ok(all
         .into_iter()
-        .filter(|wt| wt.branch.starts_with("ralph/"))
+        .filter(|wt| wt.branch.starts_with(BRANCH_PREFIX))
         .collect())
 }
 
@@ -543,10 +540,7 @@ fn copy_file_with_structure(
         return Ok(false);
     }
 
-    // Create parent directories
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    crate::utils::ensure_parent_dir(&dest)?;
 
     // Handle symlinks on Unix
     #[cfg(unix)]
@@ -672,40 +666,8 @@ pub fn sync_working_directory_to_worktree(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::init_test_repo;
     use tempfile::TempDir;
-
-    fn init_git_repo(dir: &Path) {
-        Command::new("git")
-            .args(["init", "--initial-branch=main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        Command::new("git")
-            .args(["config", "user.email", "test@test.local"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        // Create initial commit (required for worktrees)
-        fs::write(dir.join("README.md"), "# Test").unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
 
     #[test]
     fn test_worktree_config_default() {
@@ -732,7 +694,7 @@ mod tests {
     #[test]
     fn test_create_and_remove_worktree() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         let config = WorktreeConfig::default();
         let loop_id = "test-loop-123";
@@ -756,7 +718,7 @@ mod tests {
     #[test]
     fn test_create_worktree_already_exists() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         let config = WorktreeConfig::default();
         let loop_id = "duplicate";
@@ -772,7 +734,7 @@ mod tests {
     #[test]
     fn test_list_worktrees() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Initially just the main worktree
         let worktrees = list_worktrees(temp_dir.path()).unwrap();
@@ -790,7 +752,7 @@ mod tests {
     #[test]
     fn test_list_ralph_worktrees() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         let config = WorktreeConfig::default();
         let _wt1 = create_worktree(temp_dir.path(), "loop-1", &config).unwrap();
@@ -801,7 +763,7 @@ mod tests {
         assert!(
             ralph_worktrees
                 .iter()
-                .all(|wt| wt.branch.starts_with("ralph/"))
+                .all(|wt| wt.branch.starts_with(BRANCH_PREFIX))
         );
     }
 
@@ -865,7 +827,7 @@ mod tests {
     #[test]
     fn test_worktree_exists() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         let config = WorktreeConfig::default();
         let loop_id = "check-exists";
@@ -891,7 +853,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_worktree() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         let result = remove_worktree(temp_dir.path(), temp_dir.path().join("nonexistent"));
 
@@ -929,7 +891,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_get_untracked_files() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create untracked files
         fs::write(temp_dir.path().join("untracked1.txt"), "content1").unwrap();
@@ -944,7 +906,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_get_unstaged_modified_files() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Modify a tracked file without staging
         fs::write(temp_dir.path().join("README.md"), "# Modified").unwrap();
@@ -957,7 +919,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_untracked_files_to_worktree() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create an untracked file
         fs::write(temp_dir.path().join("new_file.txt"), "untracked content").unwrap();
@@ -980,7 +942,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_unstaged_changes_to_worktree() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Modify a tracked file without staging
         fs::write(temp_dir.path().join("README.md"), "# Modified Content").unwrap();
@@ -1003,7 +965,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_respects_gitignore() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Add a pattern to .gitignore
         fs::write(temp_dir.path().join(".gitignore"), "*.log\n").unwrap();
@@ -1037,7 +999,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_excludes_worktrees_directory() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create an untracked file in the worktrees directory manually
         let worktrees_dir = temp_dir.path().join(".worktrees");
@@ -1070,7 +1032,7 @@ branch refs/heads/ralph/loop-1
         use std::os::unix::fs as unix_fs;
 
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create a target file
         fs::write(temp_dir.path().join("target.txt"), "target content").unwrap();
@@ -1105,7 +1067,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_handles_binary_files() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create a binary file (PNG header bytes)
         let binary_content: Vec<u8> = vec![
@@ -1128,7 +1090,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_handles_nested_directories() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create nested untracked files
         let nested_dir = temp_dir.path().join("src/components/nested");
@@ -1149,7 +1111,7 @@ branch refs/heads/ralph/loop-1
     #[test]
     fn test_sync_stats_returned() {
         let temp_dir = TempDir::new().unwrap();
-        init_git_repo(temp_dir.path());
+        init_test_repo(temp_dir.path(), &[]);
 
         // Create untracked files
         fs::write(temp_dir.path().join("untracked1.txt"), "content").unwrap();

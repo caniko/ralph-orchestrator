@@ -205,7 +205,8 @@ impl HookExecutor {
 impl HookExecutorContract for HookExecutor {
     fn run(&self, request: HookRunRequest) -> Result<HookRunResult, HookExecutorError> {
         let started_at = Utc::now();
-        let resolved_cwd = resolve_hook_cwd(&request.workspace_root, request.cwd.as_deref());
+        let resolved_cwd =
+            crate::preflight::resolve_hook_cwd(&request.workspace_root, request.cwd.as_deref());
 
         let executable = request
             .command
@@ -514,14 +515,6 @@ fn capture_stream_output<R: Read>(
     })
 }
 
-fn resolve_hook_cwd(workspace_root: &Path, hook_cwd: Option<&Path>) -> PathBuf {
-    match hook_cwd {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => workspace_root.join(path),
-        None => workspace_root.to_path_buf(),
-    }
-}
-
 fn hook_path_override(env_map: &HashMap<String, String>) -> Option<&str> {
     env_map
         .get("PATH")
@@ -592,37 +585,7 @@ fn resolve_hook_command(
     Err(format!("command '{command}' was not found in PATH"))
 }
 
-fn executable_extensions() -> Vec<OsString> {
-    if cfg!(windows) {
-        let exts = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        exts.split(';')
-            .filter(|ext| !ext.trim().is_empty())
-            .map(|ext| OsString::from(ext.trim().to_string()))
-            .collect()
-    } else {
-        vec![OsString::new()]
-    }
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        std::fs::metadata(path)
-            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
+use crate::utils::{executable_extensions, is_executable_file};
 
 fn duration_ms(started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> u64 {
     let milliseconds = ended_at

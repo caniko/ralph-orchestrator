@@ -1050,10 +1050,29 @@ pub struct CoreConfig {
     /// This is especially important for E2E tests that run in isolated workspaces.
     #[serde(skip)]
     pub workspace_root: std::path::PathBuf,
+
+    /// Orchestration engine selector. As of the v3 cutover the autoloop runtime
+    /// is the sole engine; the in-house event loop has been removed. This field
+    /// is retained for config compatibility but no longer switches engines —
+    /// every run drives autoloop regardless of its value.
+    #[serde(default = "default_engine")]
+    pub engine: String,
+
+    /// For `engine = "autoloop"`: path to the autoloop preset directory
+    /// (`autoloops.toml` + `topology.toml` + `roles/`) to run. Relative paths
+    /// resolve against `workspace_root`.
+    #[serde(default)]
+    pub autoloop_preset: Option<String>,
 }
 
 fn default_specs_dir() -> String {
     ".ralph/specs/".to_string()
+}
+
+fn default_engine() -> String {
+    // v3: autoloop is the sole orchestration engine. The in-house event loop was
+    // deleted; this field is retained for config compatibility but is inert.
+    "autoloop".to_string()
 }
 
 fn default_guardrails() -> Vec<String> {
@@ -1078,6 +1097,8 @@ impl Default for CoreConfig {
                 .unwrap_or_else(|_| {
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                 }),
+            engine: default_engine(),
+            autoloop_preset: None,
         }
     }
 }

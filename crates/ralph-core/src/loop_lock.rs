@@ -28,7 +28,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -105,6 +105,14 @@ impl LoopLock {
     /// The relative path to the lock file within the workspace.
     pub const LOCK_FILE: &'static str = ".ralph/loop.lock";
 
+    /// Ensures the lock directory exists and opens/creates the lock file.
+    fn prepare_lock_file(workspace_root: impl AsRef<Path>) -> Result<(PathBuf, File), LockError> {
+        let lock_path = workspace_root.as_ref().join(Self::LOCK_FILE);
+        crate::utils::ensure_parent_dir(&lock_path)?;
+        let file = crate::utils::open_read_write(&lock_path)?;
+        Ok((lock_path, file))
+    }
+
     /// Try to acquire the loop lock (non-blocking).
     ///
     /// # Arguments
@@ -121,20 +129,7 @@ impl LoopLock {
         workspace_root: impl AsRef<Path>,
         prompt: &str,
     ) -> Result<LockGuard, LockError> {
-        let lock_path = workspace_root.as_ref().join(Self::LOCK_FILE);
-
-        // Ensure .ralph directory exists
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        // Open or create the lock file
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let (lock_path, file) = Self::prepare_lock_file(workspace_root)?;
 
         // Try to acquire exclusive lock (non-blocking)
         #[cfg(unix)]
@@ -196,19 +191,7 @@ impl LoopLock {
         workspace_root: impl AsRef<Path>,
         prompt: &str,
     ) -> Result<LockGuard, LockError> {
-        let lock_path = workspace_root.as_ref().join(Self::LOCK_FILE);
-
-        // Ensure .ralph directory exists
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
+        let (lock_path, file) = Self::prepare_lock_file(workspace_root)?;
 
         #[cfg(unix)]
         {
@@ -346,6 +329,7 @@ impl LoopLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::TempDir;
 
     #[test]

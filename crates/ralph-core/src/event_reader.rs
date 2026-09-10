@@ -1,6 +1,7 @@
 //! Event reader for consuming events from `.ralph/events.jsonl`.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use crate::utils::deserialize_flexible_payload_optional;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -42,7 +43,7 @@ impl MalformedLine {
         let content = if content.len() > Self::MAX_CONTENT_LEN {
             // Truncate at a valid UTF-8 character boundary to avoid panics
             // on multi-byte content.
-            let truncate_at = crate::text::floor_char_boundary(content, Self::MAX_CONTENT_LEN);
+            let truncate_at = content.floor_char_boundary(Self::MAX_CONTENT_LEN);
             format!("{}...", &content[..truncate_at])
         } else {
             content.to_string()
@@ -55,35 +56,6 @@ impl MalformedLine {
     }
 }
 
-/// Custom deserializer that accepts both String and structured JSON payloads.
-///
-/// Agents sometimes write structured data as JSON objects instead of strings.
-/// This deserializer accepts both formats:
-/// - `"payload": "string"` → `Some("string")`
-/// - `"payload": {...}` → `Some("{...}")` (serialized to JSON string)
-/// - `"payload": null` → `None`
-/// - missing field → `None`
-fn deserialize_flexible_payload<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum FlexiblePayload {
-        String(String),
-        Object(serde_json::Value),
-    }
-
-    let opt = Option::<FlexiblePayload>::deserialize(deserializer)?;
-    Ok(opt.map(|flex| match flex {
-        FlexiblePayload::String(s) => s,
-        FlexiblePayload::Object(obj) => {
-            // Serialize the object back to a JSON string
-            serde_json::to_string(&obj).unwrap_or_else(|_| obj.to_string())
-        }
-    }))
-}
-
 /// A simplified event for reading from JSONL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
@@ -91,7 +63,7 @@ pub struct Event {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_flexible_payload"
+        deserialize_with = "deserialize_flexible_payload_optional"
     )]
     pub payload: Option<String>,
     pub ts: String,
@@ -164,32 +136,66 @@ impl EventReader {
         let mut file = File::open(&self.path)?;
         file.seek(SeekFrom::Start(self.position))?;
 
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
         let mut result = ParseResult::default();
         let mut current_pos = self.position;
         let mut line_number = self.count_lines_before_position();
 
-        for line in reader.lines() {
-            let line = line?;
-            let line_bytes = line.len() as u64 + 1; // +1 for newline
+        // Consume only newline-terminated lines. A trailing chunk without a
+        // terminating `\n` is a partial line still being written by the
+        // producer (e.g. autoloop's non-fsync'd `appendFileSync`, which writes
+        // a full record per append but offers no atomicity guarantee across a
+        // concurrent reader). Consuming it would (a) mis-parse the truncated
+        // JSON as `malformed` and (b) advance `position` past it, silently
+        // dropping the remainder once the producer finishes the line. We leave
+        // `position` at the start of the partial line so it is re-read in full
+        // on the next poll. Byte accounting uses the actual bytes read (which
+        // include the `\n` and any `\r`), not `len() + 1`, so CRLF and
+        // multi-byte content do not drift the offset.
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            let bytes_read = reader.read_until(b'\n', &mut buf)?;
+            if bytes_read == 0 {
+                break; // EOF
+            }
+            if buf.last() != Some(&b'\n') {
+                // Partial, unterminated final line — do not consume.
+                break;
+            }
+
             line_number += 1;
+            current_pos += bytes_read as u64;
+
+            let line = match std::str::from_utf8(&buf) {
+                Ok(s) => s.trim_end_matches('\n').trim_end_matches('\r'),
+                Err(_) => {
+                    // Complete (newline-terminated) but not valid UTF-8.
+                    let lossy = String::from_utf8_lossy(&buf);
+                    let trimmed = lossy.trim_end_matches('\n').trim_end_matches('\r');
+                    warn!(line_number = line_number, "Non-UTF8 JSONL line");
+                    result.malformed.push(MalformedLine::new(
+                        line_number,
+                        trimmed,
+                        "invalid UTF-8".to_string(),
+                    ));
+                    continue;
+                }
+            };
 
             if line.trim().is_empty() {
-                current_pos += line_bytes;
                 continue;
             }
 
-            match serde_json::from_str::<Event>(&line) {
+            match serde_json::from_str::<Event>(line) {
                 Ok(event) => result.events.push(event),
                 Err(e) => {
                     warn!(error = %e, line_number = line_number, "Malformed JSON line");
                     result
                         .malformed
-                        .push(MalformedLine::new(line_number, &line, e.to_string()));
+                        .push(MalformedLine::new(line_number, line, e.to_string()));
                 }
             }
-
-            current_pos += line_bytes;
         }
 
         self.position = current_pos;
@@ -628,5 +634,69 @@ mod tests {
         assert_eq!(result.malformed.len(), 1);
         assert_eq!(result.events[0].topic, "valid1");
         assert_eq!(result.events[1].topic, "valid2");
+    }
+
+    #[test]
+    fn test_partial_final_line_is_not_consumed_or_dropped() {
+        // Regression: a trailing line still being written (no terminating
+        // newline) must NOT be parsed as malformed and must NOT advance the
+        // read position past it — otherwise its remainder is silently dropped
+        // once the producer finishes the line. This is the exact failure mode
+        // that breaks tailing autoloop's non-fsync'd journal in v3.
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"topic\":\"first\",\"ts\":\"t0\"}\n").unwrap();
+        // Partial second line, mid-append, no trailing newline yet.
+        file.write_all(b"{\"topic\":\"second\",\"ts\"").unwrap();
+        file.flush().unwrap();
+
+        let mut reader = EventReader::new(file.path());
+        let result = reader.read_new_events().unwrap();
+
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].topic, "first");
+        assert!(
+            result.malformed.is_empty(),
+            "a partial trailing line must not be reported malformed"
+        );
+        let pos_after_first = reader.position();
+
+        // Producer completes the second line.
+        file.write_all(b":\"t1\"}\n").unwrap();
+        file.flush().unwrap();
+
+        let result = reader.read_new_events().unwrap();
+        assert_eq!(
+            result.events.len(),
+            1,
+            "the previously-partial line must be read in full, not dropped"
+        );
+        assert_eq!(result.events[0].topic, "second");
+        assert!(result.malformed.is_empty());
+        assert!(reader.position() > pos_after_first);
+    }
+
+    #[test]
+    fn test_crlf_terminated_lines_do_not_drift_position() {
+        // Byte accounting must use the actual bytes read (incl. `\r\n`), not
+        // `len() + 1`, or the position drifts by one per CRLF line and
+        // eventually mis-frames subsequent reads.
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"{\"topic\":\"a\",\"ts\":\"t0\"}\r\n").unwrap();
+        file.write_all(b"{\"topic\":\"b\",\"ts\":\"t1\"}\r\n").unwrap();
+        file.flush().unwrap();
+
+        let mut reader = EventReader::new(file.path());
+        let result = reader.read_new_events().unwrap();
+
+        assert_eq!(result.events.len(), 2);
+        assert_eq!(result.events[0].topic, "a");
+        assert_eq!(result.events[1].topic, "b");
+        assert!(result.malformed.is_empty());
+
+        // Position must equal the full file length — no drift — so a follow-up
+        // read sees nothing new.
+        let file_len = std::fs::metadata(file.path()).unwrap().len();
+        assert_eq!(reader.position(), file_len);
+        assert!(reader.read_new_events().unwrap().events.is_empty());
     }
 }

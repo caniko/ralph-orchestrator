@@ -6,7 +6,6 @@ use ralph_adapters::{CliBackend, DEFAULT_PRIORITY};
 use ralph_core::{CheckResult, CheckStatus, ConfigError, HatBackend, PreflightReport, RalphConfig};
 use std::collections::HashSet;
 use std::env;
-use std::ffi::OsString;
 use std::path::Path;
 use std::process::Command;
 
@@ -467,43 +466,7 @@ fn command_version_ok(command: &str) -> bool {
 }
 
 fn command_exists(command: &str) -> bool {
-    let path = Path::new(command);
-    if path.components().count() > 1 {
-        return path.is_file();
-    }
-
-    let Some(path_var) = env::var_os("PATH") else {
-        return false;
-    };
-    let extensions = executable_extensions();
-
-    for dir in env::split_paths(&path_var) {
-        for ext in &extensions {
-            let candidate = if ext.is_empty() {
-                dir.join(command)
-            } else {
-                dir.join(format!("{}{}", command, ext.to_string_lossy()))
-            };
-
-            if candidate.is_file() {
-                return true;
-            }
-        }
-    }
-
-    false
-}
-
-fn executable_extensions() -> Vec<OsString> {
-    if cfg!(windows) {
-        let exts = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
-        exts.split(';')
-            .filter(|ext| !ext.trim().is_empty())
-            .map(|ext| OsString::from(ext.trim().to_string()))
-            .collect()
-    } else {
-        vec![OsString::new()]
-    }
+    ralph_core::utils::find_executable(command).is_some()
 }
 
 fn report_from_checks(checks: Vec<CheckResult>) -> PreflightReport {

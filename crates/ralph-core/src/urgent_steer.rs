@@ -1,3 +1,4 @@
+use crate::utils::now_rfc3339;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -13,7 +14,7 @@ impl UrgentSteerRecord {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             messages: vec![message.into()],
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now_rfc3339(),
         }
     }
 }
@@ -58,9 +59,7 @@ impl UrgentSteerStore {
     }
 
     pub fn write(&self, record: &UrgentSteerRecord) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        crate::utils::ensure_parent_dir(&self.path)?;
 
         let payload = serde_json::to_string(record)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
