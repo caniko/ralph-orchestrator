@@ -30,7 +30,7 @@
 //! }
 //! ```
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -59,10 +59,7 @@ impl FileLock {
                 .unwrap_or_default()
         ));
 
-        // Ensure parent directory exists
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::utils::ensure_parent_dir(&lock_path)?;
 
         Ok(Self { lock_path })
     }
@@ -173,12 +170,7 @@ impl FileLock {
 
     /// Opens or creates the lock file.
     fn open_lock_file(&self) -> io::Result<File> {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lock_path)
+        crate::utils::open_read_write(&self.lock_path)
     }
 
     /// Returns the path to the lock file.
@@ -238,10 +230,7 @@ impl LockedFile {
     /// Writes content to the file with an exclusive lock.
     pub fn write(&self, path: &Path, content: &str) -> io::Result<()> {
         let _guard = self.lock.exclusive()?;
-        // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        crate::utils::ensure_parent_dir(path)?;
         std::fs::write(path, content)
     }
 

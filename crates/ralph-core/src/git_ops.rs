@@ -5,7 +5,7 @@
 
 use std::io;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 /// Result of an auto-commit operation.
 #[derive(Debug, Clone)]
@@ -47,6 +47,93 @@ pub enum GitOpsError {
     ConfigMissing(String),
 }
 
+impl GitOpsError {
+    fn with_context(self, context: &str) -> Self {
+        match self {
+            GitOpsError::Git(msg) => GitOpsError::Git(format!("{}: {}", context, msg)),
+            other => other,
+        }
+    }
+}
+
+fn git_ok(output: Output) -> Result<Output, GitOpsError> {
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(GitOpsError::Git(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ))
+    }
+}
+
+/// Run a git command and return trimmed stdout, or a descriptive error.
+///
+/// Like [`git_output`] but returns `Err` instead of `None` on failure,
+/// including the stderr (or stdout if stderr is empty) in the error message.
+pub fn git_output_strict(path: &Path, args: &[&str]) -> Result<String, GitOpsError> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        Err(GitOpsError::Git(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            detail
+        )))
+    }
+}
+
+/// Run a git command, returning `Ok(())` on success or a descriptive error.
+pub fn git_run(path: &Path, args: &[&str]) -> Result<(), GitOpsError> {
+    git_output_strict(path, args).map(|_| ())
+}
+
+/// Run a git command and return stdout if successful, `None` otherwise.
+pub fn git_output(path: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .ok()?;
+
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Check whether a git ref (branch, tag, commit) exists.
+pub fn git_ref_exists(path: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Check whether a named git remote exists.
+pub fn git_remote_exists(path: &Path, remote: &str) -> bool {
+    Command::new("git")
+        .args(["remote", "get-url", remote])
+        .current_dir(path)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 /// Check if the working directory has uncommitted changes.
 ///
 /// Returns true if there are:
@@ -58,20 +145,8 @@ pub enum GitOpsError {
 ///
 /// * `path` - Path to the git repository (or worktree)
 pub fn has_uncommitted_changes(path: impl AsRef<Path>) -> Result<bool, GitOpsError> {
-    let path = path.as_ref();
-
-    let output = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(!stdout.trim().is_empty())
+    let stdout = git_output_strict(path.as_ref(), &["status", "--porcelain"])?;
+    Ok(!stdout.is_empty())
 }
 
 /// Auto-commit any uncommitted changes in the repository.
@@ -105,18 +180,13 @@ pub fn auto_commit_changes(
     }
 
     // Stage all changes (including untracked files)
-    let output = Command::new("git")
-        .args(["add", "-A"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(format!(
-            "Failed to stage changes: {}",
-            stderr
-        )));
-    }
+    git_ok(
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(path)
+            .output()?,
+    )
+    .map_err(|e| e.with_context("Failed to stage changes"))?;
 
     // Count staged files
     let files_staged = count_staged_files(path)?;
@@ -159,34 +229,13 @@ pub fn auto_commit_changes(
 
 /// Count the number of files staged for commit.
 fn count_staged_files(path: &Path) -> Result<usize, GitOpsError> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--name-only"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = git_output_strict(path, &["diff", "--cached", "--name-only"])?;
     Ok(stdout.lines().filter(|line| !line.is_empty()).count())
 }
 
 /// Get the HEAD commit SHA.
 pub fn get_head_sha(path: impl AsRef<Path>) -> Result<String, GitOpsError> {
-    let path = path.as_ref();
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git_output_strict(path.as_ref(), &["rev-parse", "HEAD"])
 }
 
 /// Get the current branch name.
@@ -198,20 +247,8 @@ pub fn get_head_sha(path: impl AsRef<Path>) -> Result<String, GitOpsError> {
 ///
 /// * `path` - Path to the git repository (or worktree)
 pub fn get_current_branch(path: impl AsRef<Path>) -> Result<String, GitOpsError> {
-    let path = path.as_ref();
-    let output = Command::new("git")
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .current_dir(path)
-        .output()?;
+    let branch = git_output_strict(path.as_ref(), &["rev-parse", "--abbrev-ref", "HEAD"])?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    // "HEAD" indicates detached HEAD state
     if branch == "HEAD" {
         return Err(GitOpsError::Git("Detached HEAD state".to_string()));
     }
@@ -234,39 +271,15 @@ pub fn get_current_branch(path: impl AsRef<Path>) -> Result<String, GitOpsError>
 pub fn clean_stashes(path: impl AsRef<Path>) -> Result<usize, GitOpsError> {
     let path = path.as_ref();
 
-    // First, count existing stashes
-    let output = Command::new("git")
-        .args(["stash", "list"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    let stash_count = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| !line.is_empty())
-        .count();
+    let stash_list = git_output_strict(path, &["stash", "list"])?;
+    let stash_count = stash_list.lines().filter(|line| !line.is_empty()).count();
 
     if stash_count == 0 {
         return Ok(0);
     }
 
-    // Clear all stashes
-    let output = Command::new("git")
-        .args(["stash", "clear"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(format!(
-            "Failed to clear stashes: {}",
-            stderr
-        )));
-    }
+    git_ok(Command::new("git").args(["stash", "clear"]).current_dir(path).output()?)
+        .map_err(|e| e.with_context("Failed to clear stashes"))?;
 
     Ok(stash_count)
 }
@@ -282,35 +295,13 @@ pub fn clean_stashes(path: impl AsRef<Path>) -> Result<usize, GitOpsError> {
 pub fn prune_remote_refs(path: impl AsRef<Path>) -> Result<(), GitOpsError> {
     let path = path.as_ref();
 
-    // Check if 'origin' remote exists before pruning
-    let output = Command::new("git")
-        .args(["remote"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    let remotes = String::from_utf8_lossy(&output.stdout);
+    let remotes = git_output_strict(path, &["remote"])?;
     if !remotes.lines().any(|r| r.trim() == "origin") {
-        // No origin remote, nothing to prune
         return Ok(());
     }
 
-    let output = Command::new("git")
-        .args(["remote", "prune", "origin"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(format!(
-            "Failed to prune remote refs: {}",
-            stderr
-        )));
-    }
+    git_ok(Command::new("git").args(["remote", "prune", "origin"]).current_dir(path).output()?)
+        .map_err(|e| e.with_context("Failed to prune remote refs"))?;
 
     Ok(())
 }
@@ -338,18 +329,7 @@ pub fn is_working_tree_clean(path: impl AsRef<Path>) -> Result<bool, GitOpsError
 ///
 /// * `path` - Path to the git repository (or worktree)
 pub fn get_commit_summary(path: impl AsRef<Path>) -> Result<String, GitOpsError> {
-    let path = path.as_ref();
-    let output = Command::new("git")
-        .args(["log", "-1", "--format=%h: %s"])
-        .current_dir(path)
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(GitOpsError::Git(stderr.to_string()));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git_output_strict(path.as_ref(), &["log", "-1", "--format=%h: %s"])
 }
 
 /// Get a list of files that were modified in the most recent commits.
@@ -411,46 +391,14 @@ pub fn get_recent_files(path: impl AsRef<Path>, limit: usize) -> Result<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::init_test_repo;
     use std::fs;
     use tempfile::TempDir;
-
-    fn init_git_repo(dir: &Path) {
-        Command::new("git")
-            .args(["init", "--initial-branch=main"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        Command::new("git")
-            .args(["config", "user.email", "test@test.local"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        Command::new("git")
-            .args(["config", "user.name", "Test User"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-
-        // Create initial commit
-        fs::write(dir.join("README.md"), "# Test").unwrap();
-        Command::new("git")
-            .args(["add", "README.md"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(["commit", "-m", "Initial commit"])
-            .current_dir(dir)
-            .output()
-            .unwrap();
-    }
 
     #[test]
     fn test_has_uncommitted_changes_clean() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         assert!(!has_uncommitted_changes(temp.path()).unwrap());
     }
@@ -458,7 +406,7 @@ mod tests {
     #[test]
     fn test_has_uncommitted_changes_untracked() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("new_file.txt"), "content").unwrap();
 
@@ -468,7 +416,7 @@ mod tests {
     #[test]
     fn test_has_uncommitted_changes_staged() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("staged.txt"), "content").unwrap();
         Command::new("git")
@@ -483,7 +431,7 @@ mod tests {
     #[test]
     fn test_has_uncommitted_changes_modified() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("README.md"), "# Modified").unwrap();
 
@@ -493,7 +441,7 @@ mod tests {
     #[test]
     fn test_auto_commit_no_changes() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         let result = auto_commit_changes(temp.path(), "test-loop").unwrap();
 
@@ -505,7 +453,7 @@ mod tests {
     #[test]
     fn test_auto_commit_untracked_files() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("feature.txt"), "new feature").unwrap();
 
@@ -531,7 +479,7 @@ mod tests {
     #[test]
     fn test_auto_commit_staged_changes() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("staged.txt"), "staged content").unwrap();
         Command::new("git")
@@ -550,7 +498,7 @@ mod tests {
     #[test]
     fn test_auto_commit_unstaged_modifications() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("README.md"), "# Modified content").unwrap();
 
@@ -564,7 +512,7 @@ mod tests {
     #[test]
     fn test_auto_commit_mixed_changes() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Untracked file
         fs::write(temp.path().join("new.txt"), "new").unwrap();
@@ -590,7 +538,7 @@ mod tests {
     #[test]
     fn test_auto_commit_working_tree_clean_after() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("feature.txt"), "feature").unwrap();
 
@@ -604,7 +552,7 @@ mod tests {
     #[test]
     fn test_auto_commit_returns_correct_sha() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         fs::write(temp.path().join("file.txt"), "content").unwrap();
 
@@ -618,7 +566,7 @@ mod tests {
     #[test]
     fn test_auto_commit_only_gitignored_files() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Add gitignore
         fs::write(temp.path().join(".gitignore"), "*.log\n").unwrap();
@@ -646,7 +594,7 @@ mod tests {
     #[test]
     fn test_get_current_branch() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         let branch = get_current_branch(temp.path()).unwrap();
         assert_eq!(branch, "main");
@@ -655,7 +603,7 @@ mod tests {
     #[test]
     fn test_get_current_branch_custom() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Create and checkout a new branch
         Command::new("git")
@@ -671,7 +619,7 @@ mod tests {
     #[test]
     fn test_clean_stashes_empty() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // No stashes initially
         let cleared = clean_stashes(temp.path()).unwrap();
@@ -681,7 +629,7 @@ mod tests {
     #[test]
     fn test_clean_stashes_with_stash() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Create a change and stash it
         fs::write(temp.path().join("README.md"), "# Modified").unwrap();
@@ -711,7 +659,7 @@ mod tests {
     #[test]
     fn test_prune_remote_refs_no_origin() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Should succeed even without origin remote
         prune_remote_refs(temp.path()).unwrap();
@@ -720,7 +668,7 @@ mod tests {
     #[test]
     fn test_is_working_tree_clean() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Clean working tree
         assert!(is_working_tree_clean(temp.path()).unwrap());
@@ -735,7 +683,7 @@ mod tests {
     #[test]
     fn test_get_commit_summary() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         let summary = get_commit_summary(temp.path()).unwrap();
         assert!(summary.contains("Initial commit"), "Got: {}", summary);
@@ -744,7 +692,7 @@ mod tests {
     #[test]
     fn test_get_recent_files() {
         let temp = TempDir::new().unwrap();
-        init_git_repo(temp.path());
+        init_test_repo(temp.path(), &[]);
 
         // Create and commit a new file
         fs::write(temp.path().join("feature.txt"), "content").unwrap();

@@ -18,8 +18,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::text::floor_char_boundary;
-
 use crate::file_lock::FileLock;
 use crate::memory::{Memory, MemoryType};
 use crate::memory_parser::parse_memories;
@@ -87,10 +85,7 @@ impl MarkdownMemoryStore {
             ));
         }
 
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        crate::utils::ensure_parent_dir(&self.path)?;
 
         fs::write(&self.path, self.template())
     }
@@ -123,10 +118,7 @@ impl MarkdownMemoryStore {
         let content = if self.exists() {
             fs::read_to_string(&self.path)?
         } else {
-            // Ensure parent directory exists
-            if let Some(parent) = self.path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            crate::utils::ensure_parent_dir(&self.path)?;
             self.template()
         };
 
@@ -210,10 +202,7 @@ impl MarkdownMemoryStore {
     /// This is used internally for operations like delete that need
     /// to rewrite the entire file. The caller must hold the exclusive lock.
     fn write_all_internal(&self, memories: &[Memory]) -> io::Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        crate::utils::ensure_parent_dir(&self.path)?;
 
         let mut content = String::from("# Memories\n");
 
@@ -344,7 +333,7 @@ pub fn truncate_to_budget(content: &str, budget: usize) -> String {
     }
 
     // Ensure we truncate at a valid UTF-8 character boundary
-    let safe_budget = floor_char_boundary(content, char_budget);
+    let safe_budget = content.floor_char_boundary(char_budget);
 
     // Find a good break point (end of a memory block)
     let truncated = &content[..safe_budget];

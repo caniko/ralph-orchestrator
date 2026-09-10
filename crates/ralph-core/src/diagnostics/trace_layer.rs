@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -31,10 +31,7 @@ struct TraceContext {
 impl DiagnosticTraceLayer {
     pub fn new(session_dir: &Path) -> std::io::Result<Self> {
         let trace_file = session_dir.join("trace.jsonl");
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(trace_file)?;
+        let file = crate::utils::open_append(trace_file)?;
 
         Ok(Self {
             writer: Arc::new(Mutex::new(BufWriter::new(file))),
@@ -76,8 +73,7 @@ impl<S: Subscriber> Layer<S> for DiagnosticTraceLayer {
 
         // Write to file
         let mut writer = self.writer.lock().unwrap();
-        if let Ok(json) = serde_json::to_string(&entry) {
-            let _ = writeln!(writer, "{}", json);
+        if crate::utils::write_jsonl_line(&mut *writer, &entry).is_ok() {
             let _ = writer.flush();
         }
     }

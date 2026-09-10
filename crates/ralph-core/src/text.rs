@@ -1,39 +1,10 @@
 //! Text utilities for the Ralph Orchestrator.
 //!
 //! This module provides common text manipulation functions used throughout
-//! the codebase, including UTF-8 safe string truncation.
+//! the codebase, including UTF-8 safe string truncation and TUI text
+//! sanitization.
 
-/// Finds the largest byte index <= `index` that is a valid UTF-8 character boundary.
-///
-/// This is needed because Rust strings cannot be sliced at arbitrary byte positions -
-/// only at valid character boundaries. Multi-byte characters (emojis, etc.) would cause
-/// a panic if sliced in the middle.
-///
-/// This is a stable Rust implementation of `str::floor_char_boundary` (nightly-only).
-///
-/// # Examples
-///
-/// ```
-/// use ralph_core::floor_char_boundary;
-///
-/// let s = "Hello 🦀 World";  // 🦀 is at bytes 6-9
-/// assert_eq!(floor_char_boundary(s, 6), 6);   // At start of emoji - valid boundary
-/// assert_eq!(floor_char_boundary(s, 7), 6);   // Inside emoji - returns start
-/// assert_eq!(floor_char_boundary(s, 8), 6);   // Inside emoji - returns start
-/// assert_eq!(floor_char_boundary(s, 10), 10); // After emoji - valid boundary
-/// ```
-#[must_use]
-pub fn floor_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-    // Walk backwards from index until we find a valid char boundary
-    let mut boundary = index;
-    while boundary > 0 && !s.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
+use std::borrow::Cow;
 
 /// Truncates a string to a maximum number of characters, including "..." if truncated.
 ///
@@ -86,45 +57,48 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Sanitizes text for multi-line TUI display (block content like agent output).
+///
+/// - Normalizes `\r\n` and bare `\r` to `\n`.
+/// - Strips C0 control characters (bell, backspace, vertical tab, form feed)
+///   that can corrupt terminal layout.
+/// - Preserves `\n` and `\t`.
+pub fn sanitize_tui_block_text(text: &str) -> Cow<'_, str> {
+    let has_cr = text.contains('\r');
+    let has_other_ctrl = text
+        .chars()
+        .any(|c| matches!(c, '\u{0007}' | '\u{0008}' | '\u{000b}' | '\u{000c}'));
+
+    if !has_cr && !has_other_ctrl {
+        return Cow::Borrowed(text);
+    }
+
+    let mut s = if has_cr {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_string()
+    };
+
+    if has_other_ctrl {
+        s.retain(|c| !matches!(c, '\u{0007}' | '\u{0008}' | '\u{000b}' | '\u{000c}'));
+    }
+
+    Cow::Owned(s)
+}
+
+/// Sanitizes text for single-line TUI display (tool summaries, errors).
+///
+/// Replaces all newlines and carriage returns with spaces, then strips
+/// C0 control characters that can corrupt the terminal.
+pub fn sanitize_tui_inline_text(text: &str) -> String {
+    let mut s = text.replace("\r\n", " ").replace(['\r', '\n'], " ");
+    s.retain(|c| !matches!(c, '\u{0007}' | '\u{0008}' | '\u{000b}' | '\u{000c}'));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_floor_char_boundary_ascii() {
-        let s = "hello";
-        assert_eq!(floor_char_boundary(s, 0), 0);
-        assert_eq!(floor_char_boundary(s, 3), 3);
-        assert_eq!(floor_char_boundary(s, 5), 5);
-        assert_eq!(floor_char_boundary(s, 10), 5); // Beyond string length
-    }
-
-    #[test]
-    fn test_floor_char_boundary_emoji() {
-        // 🦀 is 4 bytes (U+1F980)
-        let s = "hi🦀ok"; // h=0, i=1, 🦀=2-5, o=6, k=7
-        assert_eq!(floor_char_boundary(s, 2), 2); // Start of emoji
-        assert_eq!(floor_char_boundary(s, 3), 2); // Inside emoji
-        assert_eq!(floor_char_boundary(s, 4), 2); // Inside emoji
-        assert_eq!(floor_char_boundary(s, 5), 2); // Inside emoji
-        assert_eq!(floor_char_boundary(s, 6), 6); // After emoji
-    }
-
-    #[test]
-    fn test_floor_char_boundary_checkmark() {
-        // ✅ is 3 bytes (U+2705)
-        let s = "a✅b"; // a=0, ✅=1-3, b=4
-        assert_eq!(floor_char_boundary(s, 1), 1); // Start of checkmark
-        assert_eq!(floor_char_boundary(s, 2), 1); // Inside checkmark
-        assert_eq!(floor_char_boundary(s, 3), 1); // Inside checkmark
-        assert_eq!(floor_char_boundary(s, 4), 4); // At 'b'
-    }
-
-    #[test]
-    fn test_floor_char_boundary_empty() {
-        assert_eq!(floor_char_boundary("", 0), 0);
-        assert_eq!(floor_char_boundary("", 5), 0);
-    }
 
     #[test]
     fn test_short_string_unchanged() {
@@ -179,5 +153,35 @@ mod tests {
     fn test_single_char_truncation() {
         assert_eq!(truncate_with_ellipsis("hello", 1), "h");
         assert_eq!(truncate_with_ellipsis("🎉hello", 1), "🎉");
+    }
+
+    #[test]
+    fn sanitize_block_normalizes_crlf() {
+        let result = sanitize_tui_block_text("line1\r\nline2\rline3");
+        assert_eq!(result.as_ref(), "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn sanitize_block_strips_control_chars() {
+        let result = sanitize_tui_block_text("hello\u{0007}world\u{000b}!");
+        assert_eq!(result.as_ref(), "helloworld!");
+    }
+
+    #[test]
+    fn sanitize_block_borrows_clean_text() {
+        let result = sanitize_tui_block_text("clean text\n\ttabs ok");
+        assert!(matches!(result, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sanitize_inline_replaces_newlines_with_spaces() {
+        let s = "line1\r\nline2\nline3\rline4";
+        assert_eq!(sanitize_tui_inline_text(s), "line1 line2 line3 line4");
+    }
+
+    #[test]
+    fn sanitize_inline_strips_control_chars() {
+        let s = "hello\u{0007}\u{0008}world";
+        assert_eq!(sanitize_tui_inline_text(s), "helloworld");
     }
 }

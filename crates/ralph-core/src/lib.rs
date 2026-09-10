@@ -15,14 +15,12 @@ mod cli_capture;
 mod config;
 pub mod diagnostics;
 mod event_logger;
-mod event_loop;
 mod event_parser;
 mod event_reader;
 pub mod file_lock;
 mod git_ops;
 mod handoff;
 mod hat_registry;
-mod hatless_ralph;
 pub mod hooks;
 mod instructions;
 mod landing;
@@ -46,6 +44,7 @@ mod session_recorder;
 pub mod skill;
 pub mod skill_registry;
 mod summary_writer;
+mod termination;
 pub mod task;
 pub mod task_definition;
 pub mod task_store;
@@ -53,9 +52,6 @@ pub mod testing;
 mod text;
 mod urgent_steer;
 pub mod utils;
-pub mod wave_detection;
-pub mod wave_prompt;
-pub mod wave_tracker;
 pub mod workspace;
 pub mod worktree;
 
@@ -70,9 +66,7 @@ pub use config::{
 // Re-export loop_name types (also available via FeaturesConfig.loop_naming)
 pub use diagnostics::DiagnosticsCollector;
 pub use event_logger::{EventHistory, EventLogger, EventRecord};
-pub use event_loop::{
-    EventLoop, LoopState, ProcessedEvents, ProcessedEventsWithWaves, TerminationReason, UserPrompt,
-};
+pub use termination::TerminationReason;
 pub use event_parser::EventParser;
 pub use event_reader::{Event, EventReader, MalformedLine, ParseResult};
 pub use file_lock::{FileLock, LockGuard as FileLockGuard, LockedFile};
@@ -83,7 +77,6 @@ pub use git_ops::{
 };
 pub use handoff::{HandoffError, HandoffResult, HandoffWriter};
 pub use hat_registry::HatRegistry;
-pub use hatless_ralph::{HatInfo, HatTopology, HatlessRalph};
 pub use hooks::{
     HookDefaults, HookEngine, HookExecutor, HookExecutorContract, HookExecutorError,
     HookInvocationPayload, HookMutationConfig, HookOnError, HookPayloadBuilderInput,
@@ -116,6 +109,7 @@ pub use planning_session::{
 pub use preflight::{
     AcceptanceCriterion, CheckResult, CheckStatus, PreflightCheck, PreflightReport,
     PreflightRunner, extract_acceptance_criteria, extract_all_criteria, extract_criteria_from_file,
+    hook_path_override, resolve_hook_command, resolve_hook_cwd,
 };
 pub use preset_source::{
     PresetRegistry, PresetSource, PresetSourceError, TomlPresetSource, YamlPresetSource,
@@ -126,17 +120,14 @@ pub use session_player::{PlayerConfig, ReplayMode, SessionPlayer, TimestampedRec
 pub use session_recorder::{Record, SessionRecorder};
 pub use skill::{SkillEntry, SkillFrontmatter, SkillSource, parse_frontmatter};
 pub use skill_registry::SkillRegistry;
-pub use summary_writer::SummaryWriter;
+pub use summary_writer::{RunStats, SummaryWriter};
 pub use task::{Task, TaskStatus};
 pub use task_definition::{
     TaskDefinition, TaskDefinitionError, TaskSetup, TaskSuite, Verification,
 };
 pub use task_store::TaskStore;
-pub use text::{floor_char_boundary, truncate_with_ellipsis};
+pub use text::{sanitize_tui_block_text, sanitize_tui_inline_text, truncate_with_ellipsis};
 pub use urgent_steer::{UrgentSteerRecord, UrgentSteerStore};
-pub use wave_detection::{DetectedWave, detect_wave_events};
-pub use wave_prompt::{WaveWorkerContext, build_wave_worker_prompt};
-pub use wave_tracker::{CompletedWave, WaveFailure, WaveProgress, WaveResult, WaveTracker};
 pub use workspace::{
     CleanupPolicy, TaskWorkspace, VerificationResult, WorkspaceError, WorkspaceInfo,
     WorkspaceManager,
