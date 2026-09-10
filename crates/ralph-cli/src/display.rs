@@ -200,6 +200,13 @@ pub fn print_events_table(records: &[EventRecord], use_colors: bool) {
     println!("\n{d}Total: {} events{r}", records.len());
 }
 
+/// Truncates a string to `max_len` characters, adding an ellipsis if
+/// truncated. Thin wrapper over the shared `ralph_core::truncate_with_ellipsis`
+/// (restored after the v3 cutover refactor dropped it from this module).
+pub fn truncate(s: &str, max_len: usize) -> String {
+    truncate_with_ellipsis(s, max_len)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

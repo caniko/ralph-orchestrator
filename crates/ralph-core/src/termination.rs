@@ -90,4 +90,52 @@ impl TerminationReason {
     pub fn is_success(&self) -> bool {
         matches!(self, TerminationReason::CompletionPromise)
     }
+
+    /// Stable snake_case label recorded in loop history for a *completed* run
+    /// (i.e. any non-interrupt termination). Distinct from [`Self::as_str`]
+    /// (which is the wire payload string, e.g. `"completed"`) so history
+    /// entries stay unambiguous when the wire format changes.
+    pub fn history_label(&self) -> &'static str {
+        match self {
+            TerminationReason::CompletionPromise => "completion_promise",
+            TerminationReason::MaxIterations => "max_iterations",
+            TerminationReason::MaxRuntime => "max_runtime",
+            TerminationReason::MaxCost => "max_cost",
+            TerminationReason::ConsecutiveFailures => "consecutive_failures",
+            TerminationReason::LoopThrashing => "loop_thrashing",
+            TerminationReason::LoopStale => "loop_stale",
+            TerminationReason::ValidationFailure => "validation_failure",
+            TerminationReason::Stopped => "stopped",
+            TerminationReason::Interrupted => "interrupted",
+            TerminationReason::RestartRequested => "restart_requested",
+            TerminationReason::WorkspaceGone => "workspace_gone",
+            TerminationReason::Cancelled => "cancelled",
+        }
+    }
+
+    /// Human-readable explanation of why a merge loop was parked in the
+    /// merge queue for review (the non-successful terminations).
+    pub fn review_description(&self) -> &'static str {
+        match self {
+            TerminationReason::MaxIterations => "max iterations reached",
+            TerminationReason::MaxRuntime => "max runtime exceeded",
+            TerminationReason::MaxCost => "cost budget exceeded",
+            TerminationReason::ConsecutiveFailures => "too many consecutive failures",
+            TerminationReason::LoopThrashing => "loop thrashing detected",
+            TerminationReason::LoopStale => "stale loop detected",
+            TerminationReason::ValidationFailure => "validation failure",
+            TerminationReason::Stopped => "loop stopped",
+            TerminationReason::Interrupted => "interrupted",
+            TerminationReason::WorkspaceGone => "workspace removed",
+            TerminationReason::Cancelled => "loop cancelled",
+            TerminationReason::CompletionPromise => "completed",
+            TerminationReason::RestartRequested => "restart requested",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
