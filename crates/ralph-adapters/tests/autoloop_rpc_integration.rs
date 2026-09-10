@@ -557,13 +557,12 @@ fn rpc_lifecycle_event_ordering_is_contracted() {
             reason,
             total_iterations,
             total_cost_usd,
-            duration_ms,
+            duration_ms: _,
             terminated_at,
         } => {
             assert_eq!(*reason, TerminationReason::Completed);
             assert_eq!(*total_iterations, 2);
             assert!((*total_cost_usd - 0.21).abs() < f64::EPSILON);
-            assert!(*duration_ms >= 0);
             assert!(*terminated_at >= 1_000);
         }
         other => panic!("expected terminal LoopTerminated, got {other:?}"),
