@@ -201,8 +201,9 @@ pub async fn run_autoloop_engine(
         auto_merge,
         &loop_id,
         use_colors,
-        // In RPC mode stdout is the protocol channel — the banner's content is
-        // already delivered as the LoopTerminated event.
+        // RPC mode keeps stdout as the clean RpcEvent protocol channel, so the
+        // human-readable termination banner is suppressed (the terminal
+        // LoopTerminated event already conveys the outcome).
         !rpc,
     );
 
