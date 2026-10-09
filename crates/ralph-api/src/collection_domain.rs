@@ -1103,7 +1103,9 @@ mod tests {
             "error must return without waiting for the inherited handle (took {elapsed:?})"
         );
         // Proof of cleanup (the drop-guard is the backstop, not the proof):
-        // terminate the recorded descendant and require it gone.
+        // terminate the recorded descendant and require it no longer running.
+        // An orphan may remain a zombie when container PID 1 does not reap it;
+        // kill -0 alone cannot distinguish that from a live descendant.
         let pid = std::fs::read_to_string(temp.path().join("sleep.pid"))
             .expect("descendant pid recorded")
             .trim()
@@ -1117,21 +1119,26 @@ mod tests {
             .arg(format!("kill {pid} 2>/dev/null"))
             .status();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut gone = false;
+        let mut stopped = false;
         while std::time::Instant::now() < deadline {
-            let still_alive = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("kill -0 {pid} 2>/dev/null"))
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if !still_alive {
-                gone = true;
+            let process = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid])
+                .output()
+                .expect("query descendant process state");
+            assert!(
+                process.status.success()
+                    || (process.status.code() == Some(1) && process.stderr.is_empty()),
+                "ps must report the descendant state: {process:?}"
+            );
+            let state = String::from_utf8(process.stdout).expect("process state is UTF-8");
+            let state = state.trim();
+            if state.is_empty() || state.starts_with('Z') {
+                stopped = true;
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        assert!(gone, "test descendant {pid} must be gone after cleanup");
+        assert!(stopped, "test descendant {pid} must stop after cleanup");
     }
 
     #[test]
